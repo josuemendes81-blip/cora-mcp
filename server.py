@@ -56,11 +56,13 @@ mcp = FastMCP("cora", host="0.0.0.0", streamable_http_path=f"/{SECRET_PATH}")
 @mcp.tool()
 def saldo() -> dict:
     """Saldo atual da conta Cora (em reais)."""
-    d = call("GET", "/bank-statement/statement",
-             params={"start": (dt.date.today()-dt.timedelta(days=30)).isoformat(),
-                     "end": dt.date.today().isoformat(), "perPage": 1, "aggr": "false"})
-    if "erro" in d: return d
-    return {"saldo_reais": reais(d.get("end", {}).get("balance")), "titular": d.get("header", {}).get("businessName")}
+    # Endpoint próprio de saldo; o "end.balance" do extrato vem 0 e não serve para isso.
+    b = call("GET", "/third-party/account/balance")
+    if "erro" in b: return b
+    h = call("GET", "/bank-statement/statement",
+             params={"start": dt.date.today().isoformat(), "end": dt.date.today().isoformat(), "perPage": 1})
+    return {"saldo_reais": reais(b.get("balance")), "bloqueado_reais": reais(b.get("blockedBalance")),
+            "titular": h.get("header", {}).get("businessName") if "erro" not in h else None}
 
 @mcp.tool()
 def extrato(inicio: str, fim: str, tipo: str = "") -> dict:
