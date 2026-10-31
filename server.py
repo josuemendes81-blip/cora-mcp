@@ -181,14 +181,17 @@ def pluggy_contas() -> dict:
 @mcp.tool()
 def pluggy_extrato(account_id: str, inicio: str, fim: str) -> dict:
     """Transações de uma conta Pluggy entre duas datas (YYYY-MM-DD), todas as páginas. Valores em reais (negativo = saída)."""
-    tx, page = [], 1
-    while True:
-        d = pcall("GET", "/transactions", params={"accountId": account_id, "from": inicio, "to": fim,
-                                                   "pageSize": 500, "page": page})
+    # /transactions (v1) foi descontinuado (410); v2 usa dateFrom/dateTo e cursor em "next".
+    from urllib.parse import parse_qsl
+    base = {"accountId": account_id, "dateFrom": inicio, "dateTo": fim}
+    tx, params = [], dict(base)
+    for _ in range(100):
+        d = pcall("GET", "/v2/transactions", params=params)
         if "erro" in d: return d
         tx += d.get("results", [])
-        if page >= (d.get("totalPages") or 1): break
-        page += 1
+        nxt = d.get("next")
+        if not nxt: break
+        params = {**base, **dict(parse_qsl(nxt.split("?", 1)[-1]))}
     lanc = [{"data": _dia(t.get("date")), "descricao": t.get("description"), "valor_reais": _rs(t.get("amount")),
              "tipo": t.get("type"), "categoria": t.get("category"), "status": t.get("status"),
              **({"parcela": f'{t["creditCardMetadata"].get("installmentNumber")}/{t["creditCardMetadata"].get("totalInstallments")}'}
