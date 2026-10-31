@@ -116,6 +116,105 @@ def pagamento_cancelar(id_pagamento: str) -> dict:
     """Cancela uma iniciação de pagamento ainda não aprovada."""
     return call("DELETE", f"/payments/initiate/{id_pagamento}")
 
+# ─────────────────────────── Pluggy (Open Finance) ───────────────────────────
+# Variáveis: PLUGGY_CLIENT_ID e PLUGGY_CLIENT_SECRET. Opcional: PLUGGY_ITEM_IDS (ids separados
+# por vírgula) caso a API não liste os items da aplicação.
+PLUGGY_BASE = "https://api.pluggy.ai"
+_pk = {"value": None, "exp": 0}
+
+def _pluggy_key():
+    if _pk["value"] and time.time() < _pk["exp"]:
+        return _pk["value"]
+    cid, sec = os.environ.get("PLUGGY_CLIENT_ID"), os.environ.get("PLUGGY_CLIENT_SECRET")
+    if not cid or not sec:
+        raise RuntimeError("PLUGGY_CLIENT_ID/PLUGGY_CLIENT_SECRET não configurados")
+    r = httpx.post(f"{PLUGGY_BASE}/auth", json={"clientId": cid, "clientSecret": sec}, timeout=30)
+    r.raise_for_status()
+    _pk["value"] = r.json()["apiKey"]
+    _pk["exp"] = time.time() + 2 * 3600 - 300          # apiKey vale 2h; renova 5 min antes
+    return _pk["value"]
+
+def pcall(method, path, **kw):
+    try:
+        key = _pluggy_key()
+    except Exception as e:
+        return {"erro": "auth", "detalhe": str(e)[:300]}
+    for tentativa in (1, 2):
+        r = httpx.request(method, f"{PLUGGY_BASE}{path}", headers={"X-API-KEY": key}, timeout=30, **kw)
+        if r.status_code == 401 and tentativa == 1:     # chave expirada antes da hora: renova uma vez
+            _pk["value"] = None; key = _pluggy_key(); continue
+        break
+    if r.status_code >= 400:
+        return {"erro": r.status_code, "detalhe": r.text[:500]}
+    return r.json() if r.content else {"ok": True}
+
+_rs = lambda v: round(v, 2) if isinstance(v, (int, float)) else v      # Pluggy já devolve reais
+_dia = lambda s: (s or "")[:10] or None
+
+def _conta(a):
+    cd = a.get("creditData") or {}
+    return {"id": a.get("id"), "nome": a.get("name"), "tipo": a.get("type"), "subtipo": a.get("subtype"),
+            "numero": a.get("number"), "saldo_reais": _rs(a.get("balance")), "moeda": a.get("currencyCode"),
+            **({"limite_reais": _rs(cd.get("creditLimit")), "limite_disponivel_reais": _rs(cd.get("availableCreditLimit")),
+                "vencimento_fatura": _dia(cd.get("balanceDueDate")), "fechamento_fatura": _dia(cd.get("balanceCloseDate"))}
+               if cd else {})}
+
+@mcp.tool()
+def pluggy_contas() -> dict:
+    """Instituições conectadas na Pluggy (items) e as contas/cartões de cada uma, com saldo em reais."""
+    d = pcall("GET", "/items")
+    if "erro" in d:
+        ids = [i.strip() for i in os.environ.get("PLUGGY_ITEM_IDS", "").split(",") if i.strip()]
+        if not ids: return d
+        items = [pcall("GET", f"/items/{i}") for i in ids]
+    else:
+        items = d.get("results", d if isinstance(d, list) else [])
+    out = []
+    for it in items:
+        if "erro" in it: out.append(it); continue
+        acc = pcall("GET", "/accounts", params={"itemId": it.get("id")})
+        out.append({"item_id": it.get("id"), "instituicao": (it.get("connector") or {}).get("name"),
+                    "status": it.get("status"), "atualizado_em": _dia(it.get("lastUpdatedAt")),
+                    "contas": acc if "erro" in acc else [_conta(a) for a in acc.get("results", [])]})
+    return {"items": out}
+
+@mcp.tool()
+def pluggy_extrato(account_id: str, inicio: str, fim: str) -> dict:
+    """Transações de uma conta Pluggy entre duas datas (YYYY-MM-DD), todas as páginas. Valores em reais (negativo = saída)."""
+    tx, page = [], 1
+    while True:
+        d = pcall("GET", "/transactions", params={"accountId": account_id, "from": inicio, "to": fim,
+                                                   "pageSize": 500, "page": page})
+        if "erro" in d: return d
+        tx += d.get("results", [])
+        if page >= (d.get("totalPages") or 1): break
+        page += 1
+    lanc = [{"data": _dia(t.get("date")), "descricao": t.get("description"), "valor_reais": _rs(t.get("amount")),
+             "tipo": t.get("type"), "categoria": t.get("category"), "status": t.get("status"),
+             **({"parcela": f'{t["creditCardMetadata"].get("installmentNumber")}/{t["creditCardMetadata"].get("totalInstallments")}'}
+                if (t.get("creditCardMetadata") or {}).get("totalInstallments") else {})} for t in tx]
+    ent = sum(t["valor_reais"] for t in lanc if t["tipo"] == "CREDIT")
+    sai = sum(t["valor_reais"] for t in lanc if t["tipo"] == "DEBIT")
+    return {"total": len(lanc), "total_entradas_reais": round(ent, 2), "total_saidas_reais": round(sai, 2),
+            "lancamentos": lanc}
+
+@mcp.tool()
+def pluggy_faturas(account_id: str) -> dict:
+    """Faturas de um cartão de crédito conectado na Pluggy (valores em reais, datas YYYY-MM-DD)."""
+    d = pcall("GET", "/bills", params={"accountId": account_id})
+    if "erro" in d: return d
+    return {"faturas": [{"id": b.get("id"), "vencimento": _dia(b.get("dueDate")),
+                         "total_reais": _rs(b.get("totalAmount")), "minimo_reais": _rs(b.get("minimumPaymentAmount")),
+                         "moeda": b.get("totalAmountCurrencyCode")} for b in d.get("results", [])]}
+
+@mcp.tool()
+def pluggy_atualizar(item_id: str) -> dict:
+    """Pede à Pluggy para sincronizar de novo uma instituição (item). Os dados chegam em alguns minutos."""
+    d = pcall("PATCH", f"/items/{item_id}", json={})
+    if "erro" in d: return d
+    return {"item_id": d.get("id"), "status": d.get("status"), "execucao": d.get("executionStatus"),
+            "aviso": "Atualização solicitada; consulte pluggy_contas em alguns minutos."}
+
 if __name__ == "__main__":
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
         mcp.settings.host = "0.0.0.0"
